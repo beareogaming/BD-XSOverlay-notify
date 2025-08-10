@@ -1,15 +1,15 @@
 /**
  * @name XSOverlayNotifier
  * @author Ko
- * @version 2.7.0
- * @description Sends Discord notifications to XSOverlay (SteamVR) over the official WebSocket API. Single-port (default 42070), avatar-as-icon, default chime, strict trimming (no blank lines), optional dynamic toast height, queue cap, markdown stripping, embed/sticker handling, jittered reconnect.
+ * @version 2.8.0
+ * @description Sends Discord notifications to XSOverlay (SteamVR) over the official WebSocket API. Single-port (default 42070), avatar-as-icon, default chime, strict trimming (no blank lines), optional dynamic toast height, queue cap, markdown stripping, embed/sticker handling, jittered reconnect. New in 2.8.0: drop notifications while disconnected (no backlog) and optional auto-clear of any queued items on disconnect.
  * @source https://example.com/XSOverlayNotifier.plugin.js
  * @updateUrl https://example.com/XSOverlayNotifier.plugin.js
  */
 
 module.exports = class XSOverlayNotifier {
     constructor() {
-        this.meta = { name: "XSOverlayNotifier", version: "2.7.0" };
+        this.meta = { name: "XSOverlayNotifier", version: "2.8.0" };
 
         this.defaultSettings = {
             host: "127.0.0.1",
@@ -35,7 +35,7 @@ module.exports = class XSOverlayNotifier {
             opacity: 1,             // 0..1
 
             // height behavior
-            autoHeight: true,       // <-- NEW: dynamically size by content length
+            autoHeight: true,       // dynamically size by content length
             height: 175,            // used when autoHeight = false
             minHeight: 140,         // clamp lower bound for autoHeight
             maxHeight: 520,         // clamp upper bound for autoHeight
@@ -47,7 +47,11 @@ module.exports = class XSOverlayNotifier {
             forceDefaultSound: true,    // always play XSOverlay default chime
             avatarIcon: true,           // use author's avatar as icon
             fallbackIcon: "",           // "", "default"/"error"/"warning", file path, or base64
-            useBase64Icon: true         // keep true for avatar data
+            useBase64Icon: true,        // keep true for avatar data
+
+            // NEW (2.8.0): queuing policy
+            queueWhileDisconnected: false,  // drop notifications if WS is down
+            clearQueueOnDisconnect: true    // wipe any queued items on disconnect/error
         };
 
         this.ws = null;
@@ -58,6 +62,7 @@ module.exports = class XSOverlayNotifier {
         this._backoff = 1000;
         this._backoffMax = 15000;
         this._maxQueue = 200;
+        this._reconnectTimer = null;
     }
 
     /* ========================= BetterDiscord Lifecycle ========================= */
@@ -179,6 +184,11 @@ module.exports = class XSOverlayNotifier {
                 React.createElement("hr", null),
                 Bool({k:"autoConnect", label:"Auto-connect at startup"}),
                 Bool({k:"logDebug", label:"Debug logging"}),
+
+                React.createElement("hr", null),
+                // NEW toggles for 2.8.0
+                Bool({k:"queueWhileDisconnected", label:"Queue notifications while disconnected"}),
+                Bool({k:"clearQueueOnDisconnect", label:"Clear queue on disconnect"}),
 
                 React.createElement("div", {style:{display:"flex", gap:8, marginTop:12}},
                     Button({label: this.connected ? "Connected" : (this.connecting ? "Connecting…" : "Connect"), onClick: reconnect}),
@@ -372,6 +382,7 @@ module.exports = class XSOverlayNotifier {
         this._log("XSOverlay disconnected.");
         this.connected = false;
         this.connecting = false;
+        if (this.settings.clearQueueOnDisconnect) this._clearQueue();
         this._scheduleReconnect();
     }
 
@@ -379,10 +390,15 @@ module.exports = class XSOverlayNotifier {
         this._log("WS error", err);
         this._disconnect(true);
         this.connecting = false;
+        if (this.settings.clearQueueOnDisconnect) this._clearQueue();
         this._scheduleReconnect();
     }
 
     _disconnect(silent = false) {
+        if (this._reconnectTimer) {
+            clearTimeout(this._reconnectTimer);
+            this._reconnectTimer = null;
+        }
         if (this.ws) {
             try {
                 this.ws.removeEventListener("open", this._onWSOpen);
@@ -395,6 +411,7 @@ module.exports = class XSOverlayNotifier {
         }
         this.connected = false;
         this.connecting = false;
+        if (this.settings.clearQueueOnDisconnect) this._clearQueue();
         if (!silent) this._log("Disconnected from XSOverlay.");
     }
 
@@ -404,7 +421,11 @@ module.exports = class XSOverlayNotifier {
         const wait = this._backoff + jitter;
         this._backoff = Math.min(this._backoff * 2, this._backoffMax);
         this._log(`Reconnecting in ${Math.floor(wait/1000)}s…`);
-        setTimeout(() => this._connect(), wait);
+        if (this._reconnectTimer) clearTimeout(this._reconnectTimer);
+        this._reconnectTimer = setTimeout(() => {
+            this._reconnectTimer = null;
+            this._connect();
+        }, wait);
     }
 
     /* ================================ Sending ================================= */
@@ -422,10 +443,17 @@ module.exports = class XSOverlayNotifier {
         setTimeout(() => {
             this._lastSentAt = Date.now();
             const envelope = this._buildEnvelope(note);
-            if (this.connected) this._sendRaw(envelope);
-            else {
-                if (this.queue.length >= this._maxQueue) this.queue.shift();
-                this.queue.push(envelope);
+
+            if (this.connected) {
+                this._sendRaw(envelope);
+            } else {
+                if (this.settings.queueWhileDisconnected) {
+                    if (this.queue.length >= this._maxQueue) this.queue.shift();
+                    this.queue.push(envelope);
+                } else {
+                    if (this.settings.logDebug) this._log("Dropping notification (WS disconnected).");
+                    // dropped intentionally
+                }
             }
         }, delay);
     }
@@ -563,6 +591,11 @@ module.exports = class XSOverlayNotifier {
     _cap(str, n) {
         const s = String(str || "");
         return s.length > n ? s.slice(0, n) : s;
+    }
+
+    _clearQueue() {
+        if (this.queue.length && this.settings?.logDebug) this._log(`Clearing ${this.queue.length} queued notifications`);
+        this.queue.length = 0;
     }
 
     _save() {
